@@ -265,29 +265,6 @@ __device__ void tracebackSeqtoSeq
     tbPointersLen[0] = currentTbPointersIdx;
 
 }
-/*
-            int ref_index = currentRefStartCord + tx;
-            int query_index = currentQueryStartCord + tx;         
-
-            //char * ref = d_ref + currentRefStartCord;
-            //char * query = d_query + currentQueryStartCord;
-            //    Create shared memory for query and reference
-            __shared__ char ref[256];
-            __shared__ char query[256];
-
-                        if(tx<currentRefLength){
-                ref[tx] = d_ref[ref_index];
-            }
-                    __syncthreads();
-                    if(tx<currentQueryLength){
-                        query[tx] = d_query[query_index];
-                    }
-                    __syncthreads();
-                    */
-
-__device__ int32_t max3(int32_t a, int32_t b, int32_t c) {
-    return max(max(a, b), c);
-}
 
 __global__ void alignSeqToSeq
 (
@@ -311,8 +288,12 @@ __global__ void alignSeqToSeq
 
     int bs = blockDim.x;
     int gs = gridDim.x;
-    int tid = threadIdx.x + blockIdx.x*blockDim.x;
-        for (size_t n= blockIdx.x; n<d_numAlignments; n+= gridDim.x)
+
+
+    
+    if (tx==0 and bx==0)
+    {
+        for (size_t n=0; n<d_numAlignments; n++)
         {
             size_t currentRefLength = refLen[n];
             size_t currentQueryLength = queryLen[n];
@@ -320,36 +301,18 @@ __global__ void alignSeqToSeq
             size_t currentRefStartCord = refStartCord[n];
             size_t currentQueryStartCord = queryStartCord[n];
 
-            int ref_index = currentRefStartCord + tx;
-            int query_index = currentQueryStartCord + tx;         
-
-            //    Create shared memory for query and reference
-            __shared__ char ref[256];
-            __shared__ char query[256];
-
-                        if(tx<currentRefLength){
-                ref[tx] = d_ref[ref_index];
-            }
-                    __syncthreads();
-                    if(tx<currentQueryLength){
-                        query[tx] = d_query[query_index];
-                    }
-                    __syncthreads();
-            
+            char * ref = d_ref + currentRefStartCord;
+            char * query = d_query + currentQueryStartCord;
             
             int8_t * currentTbPointers = tbPointers + n*512;
             int32_t * currentTbPointersLen = tbPointersLen + n;
 
             size_t maxWFLen = currentRefLength + currentQueryLength + 2; //wavefront length
 
-            __shared__ int32_t score[500];
-          //  __shared__ int32_t insOp[500];
-           // __shared__ int32_t delOp[500];
-            for (size_t i=tx;i<500;i+=bs) {score[i] = 0; }//insOp[i] = -INF; delOp[i] = -INF;}
-            __syncthreads();
+            int32_t score = 0;
             int32_t maxScore = 0;
 
-            __shared__ int32_t H[3][500];
+            int32_t H[3][500];
             int32_t L[3], U[3];
 
             int32_t wfLL[256*2+2];
@@ -359,18 +322,16 @@ __global__ void alignSeqToSeq
 
             int8_t state=0;
 
-            for(size_t i=tx; i<3; i+=bs)
+            for(size_t i=0; i<3; i++)
             {
                 L[i]=0; U[i]=0;
             }
-                __syncthreads();
-           for (size_t i=0; i<3; i++)
+
+            for (size_t i=0; i<3; i++)
             {
-                for (size_t j=tx; j<500; j+=bs) H[i][j] = 0;
+                for (size_t j=0; j<500; j++) H[i][j] = 0;
             }
 
-            __syncthreads();
-                int32_t offset = 0;
             /* k -> Antidiagonal Index */
             for (int32_t k=0; k<currentRefLength+currentQueryLength+1; k++)
             {
@@ -379,47 +340,71 @@ __global__ void alignSeqToSeq
                 wfLL[k] = L[k%3];
                 wfLen[k] = U[k%3]-L[k%3]+1;
 
-              for(int32_t i=L[k%3]+tx; i<U[k%3]+1; i+=bs) // i -> Reference Index
+                for(int32_t i=L[k%3]; i<U[k%3]+1; i++) // i -> Reference Index
                 {   
                     int32_t j=(k-i); //j->Query Index
                     int32_t match = -INF, insOp = -INF, delOp = -INF;
-                    offset = i-L[k%3];
+                    int32_t offset = i-L[k%3];
                     int32_t offsetDiag = L[k%3]-L[(k+1)%3]+offset-1;
                     int32_t offsetUp = L[k%3]-L[(k+2)%3]+offset;
                     int32_t offsetLeft = L[k%3]-L[(k+2)%3]+offset-1;
-                   
+
+
                     if (k==0) match = 0;
                     
-                    if (offsetDiag>=0 && i-1>=0 && j-1>=0)
+                    if (offsetDiag>=0)
                     {
                         char refVal = ref[i-1];
                         char queryVal = query[j-1];
                         if (refVal == queryVal) match = H[(k+1)%3][offsetDiag] + matchPoints;
                         else match = H[(k+1)%3][offsetDiag] + mismatchPoints;
                     }
-                    __syncthreads();
+                    
                     if (offsetUp >= 0)
                         insOp = H[(k+2)%3][offsetUp] + gapOpenPoints;
-                    __syncthreads();
+
                     if (offsetLeft >=0)
                         delOp = H[(k+2)%3][offsetLeft] + gapOpenPoints;
-                    __syncthreads();
 
-                     
-                    H[k%3][offset] = max3(insOp,delOp,match);
-                   __syncthreads();
-                    score[offset] = H[k%3][offset];
-                    __syncthreads();
+                    
+                    if (match > insOp) 
+                    {
+                        if (match > delOp) 
+                        {
+                            H[k%3][offset] = match;
+                            state = 0;
+                        }
+                        else 
+                        {
+                            H[k%3][offset] = delOp;
+                            state = 1;
+                        }
+                    }
+                    else if (insOp > delOp) 
+                    {
+                        H[k%3][offset] = insOp;
+                        state = 1;
+                    }
+                    else 
+                    {
+                        H[k%3][offset] = delOp;
+                        state = 2;
+                    }
 
+                    tbMatrix[tbIdx++] = state;
+
+                    score = H[k%3][offset];
+                    if (score > maxScore) maxScore = score;
                 }
-                
             }
-            if(tx==0)       //Thread 0 of each block updates its scores to d_scores
-            d_scores[n] = score[offset];
-           // __syncthreads();
-          //  tracebackSeqtoSeq(tbMatrix,tbIdx, wfLL, wfLen, currentRefLength, currentQueryLength, currentTbPointers, currentTbPointersLen);
+            
+            d_scores[n] = score;
+            tracebackSeqtoSeq(tbMatrix,tbIdx, wfLL, wfLen, currentRefLength, currentQueryLength, currentTbPointers, currentTbPointersLen);
         }
+        
     }
+
+}
 
 
 
@@ -440,8 +425,8 @@ void NWGPU::NWonGPU
     int32_t * d_tbPointersLen
 ){
 
-    int blockPerGrid = 1024;
-    int threadsPerBlock = 256;
+    int blockPerGrid = 1;
+    int threadsPerBlock = 1;
 
 
     alignSeqToSeq<<<blockPerGrid,threadsPerBlock>>>( d_numAlignments,
@@ -486,13 +471,13 @@ void NWGPU::DeviceArrays::printTbPointers(size_t h_numAlignments)
     int8_t* tbPointers = new int8_t[h_numAlignments*512];
     int32_t* tbPointersLen = new int32_t[h_numAlignments];
 
-   // err = cudaMemcpy(tbPointers, d_tbPointers, h_numAlignments*512*sizeof(int8_t), cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(tbPointers, d_tbPointers, h_numAlignments*512*sizeof(int8_t), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: cudaMemCpy failed!\n");
         exit(1);
     }
 
-   // err = cudaMemcpy(tbPointersLen, d_tbPointersLen, h_numAlignments*sizeof(int32_t), cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(tbPointersLen, d_tbPointersLen, h_numAlignments*sizeof(int32_t), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: cudaMemCpy failed!\n");
         exit(1);
@@ -501,12 +486,12 @@ void NWGPU::DeviceArrays::printTbPointers(size_t h_numAlignments)
     for (size_t i=0; i<h_numAlignments; i++)
     {
         int8_t * currentTbPointers = tbPointers + 512*i;
-    //    printf ("%d\t", i);
+        printf ("%d\t", i);
         for (size_t j=0; j<tbPointersLen[i]; j++)
         {
-      //      printf("%d ", currentTbPointers[j]);
+            printf("%d ", currentTbPointers[j]);
         }
-       // printf("\n");
+        printf("\n");
     }
 }
 
