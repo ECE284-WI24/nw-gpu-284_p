@@ -289,6 +289,7 @@ __device__ int32_t max3(int32_t a, int32_t b, int32_t c) {
     return max(max(a, b), c);
 }
 
+/* Without Xdrop
 __global__ void alignSeqToSeq
 (
     size_t d_numAlignments,
@@ -343,13 +344,12 @@ __global__ void alignSeqToSeq
             size_t maxWFLen = currentRefLength + currentQueryLength + 2; //wavefront length
 
             __shared__ int32_t score[500];
-          //  __shared__ int32_t insOp[500];
-           // __shared__ int32_t delOp[500];
             for (size_t i=tx;i<500;i+=bs) {score[i] = 0; }//insOp[i] = -INF; delOp[i] = -INF;}
             __syncthreads();
             int32_t maxScore = 0;
 
             __shared__ int32_t H[3][500];
+           
             int32_t L[3], U[3];
 
             int32_t wfLL[256*2+2];
@@ -371,7 +371,6 @@ __global__ void alignSeqToSeq
 
             __syncthreads();
                 int32_t offset = 0;
-            /* k -> Antidiagonal Index */
             for (int32_t k=0; k<currentRefLength+currentQueryLength+1; k++)
             {
                 L[k%3] = (k<=currentQueryLength)?0:k-currentQueryLength;
@@ -410,17 +409,190 @@ __global__ void alignSeqToSeq
                    __syncthreads();
                     score[offset] = H[k%3][offset];
                     __syncthreads();
-
                 }
                 
             }
             if(tx==0)       //Thread 0 of each block updates its scores to d_scores
             d_scores[n] = score[offset];
-           // __syncthreads();
-          //  tracebackSeqtoSeq(tbMatrix,tbIdx, wfLL, wfLen, currentRefLength, currentQueryLength, currentTbPointers, currentTbPointersLen);
         }
     }
+*/
+__inline__ __device__ void warpReduce(volatile int32_t *input,
+										  int myTId){
+		input[myTId] = (input[myTId] > input[myTId + 32]) ? input[myTId] : input[myTId + 32]; 
+		input[myTId] = (input[myTId] > input[myTId + 16]) ? input[myTId] : input[myTId + 16];
+		input[myTId] = (input[myTId] > input[myTId + 8]) ? input[myTId] : input[myTId + 8]; 
+		input[myTId] = (input[myTId] > input[myTId + 4]) ? input[myTId] : input[myTId + 4];
+		input[myTId] = (input[myTId] > input[myTId + 2]) ? input[myTId] : input[myTId + 2];
+		input[myTId] = (input[myTId] > input[myTId + 1]) ? input[myTId] : input[myTId + 1];
+}
 
+__inline__ __device__ int_32_t reduce_max(int32_t *input, int32_t dim, int n_threads){
+	unsigned int myTId = threadIdx.x;   
+	if(dim>32){
+		for(int i = n_threads/2; i >32; i>>=1){
+			if(myTId < i){
+						input[myTId] = (input[myTId] > input[myTId + i]) ? input[myTId] : input[myTId + i];
+			}__syncthreads();
+		}//__syncthreads();
+	}
+	if(myTId<32)
+		warpReduce(input, myTId);
+	__syncthreads();
+	return input[0];
+}
+
+
+//With Xdrop
+__global__ void alignSeqToSeq
+(
+    size_t d_numAlignments,
+    char* d_ref,
+    char* d_query,
+    size_t * refLen,
+    size_t * queryLen,
+    size_t * refStartCord,
+    size_t * queryStartCord,
+    int matchPoints, 
+    int mismatchPoints,
+    int gapOpenPoints,
+    int * d_scores,
+    int8_t * tbPointers,
+    int32_t * tbPointersLen,
+    int *Xdrop_value
+){
+
+    int tx = threadIdx.x;
+    int bx = blockIdx.x;
+
+    int bs = blockDim.x;
+    int gs = gridDim.x;
+    int tid = threadIdx.x + blockIdx.x*blockDim.x;
+
+//	if(tx==0 && bx==0){
+//		printf("Xdrop  val = %d",*Xdrop_value);
+//	}
+
+        for (size_t n= blockIdx.x; n<d_numAlignments; n+= gridDim.x)
+        {
+            size_t currentRefLength = refLen[n];
+            size_t currentQueryLength = queryLen[n];
+
+            size_t currentRefStartCord = refStartCord[n];
+            size_t currentQueryStartCord = queryStartCord[n];
+
+            int ref_index = currentRefStartCord + tx;
+            int query_index = currentQueryStartCord + tx;   
+            __shared__ int32_t max_seen_antidiag;
+            __shared__ int32_t max_seen_current;
+                if(tx==0){
+                    max_seen_antidiag = -INF;    
+                    max_seen_current = -INF;  
+                }
+                __syncthreads();
+            //    Create shared memory for query and reference
+            __shared__ char ref[256];
+            __shared__ char query[256];
+
+                        if(tx<currentRefLength){
+                ref[tx] = d_ref[ref_index];
+            }
+                    __syncthreads();
+                    if(tx<currentQueryLength){
+                        query[tx] = d_query[query_index];
+                    }
+                    __syncthreads();
+            
+            
+            int8_t * currentTbPointers = tbPointers + n*512;
+            int32_t * currentTbPointersLen = tbPointersLen + n;
+
+            size_t maxWFLen = currentRefLength + currentQueryLength + 2; //wavefront length
+
+            __shared__ int32_t score[500];
+            for (size_t i=tx;i<500;i+=bs) {score[i] = 0; }//insOp[i] = -INF; delOp[i] = -INF;}
+            __syncthreads();
+            int32_t maxScore = 0;
+
+            __shared__ int32_t H[3][500];
+           
+            int32_t L[3], U[3];
+
+            int32_t wfLL[256*2+2];
+            int32_t wfLen[256*2+2];
+            int8_t tbMatrix[258*258]; //(256+2)^2
+            int32_t tbIdx = 0;
+
+            int8_t state=0;
+
+            for(size_t i=tx; i<3; i+=bs)
+            {
+                L[i]=0; U[i]=0;
+            }
+                __syncthreads();
+           for (size_t i=0; i<3; i++)
+            {
+                for (size_t j=tx; j<500; j+=bs) H[i][j] = 0;
+            }
+
+            __syncthreads();    
+                int32_t offset = 0;
+            for (int32_t k=0; k<currentRefLength+currentQueryLength+1; k++)
+            {
+                L[k%3] = (k<=currentQueryLength)?0:k-currentQueryLength;
+                U[k%3] = (k<=currentRefLength)?k:currentRefLength;
+                wfLL[k] = L[k%3];
+                wfLen[k] = U[k%3]-L[k%3]+1;
+
+              for(int32_t i=L[k%3]+tx; i<U[k%3]+1; i+=bs) // i -> Reference Index
+                {   
+                    int32_t j=(k-i); //j->Query Index
+                    int32_t match = -INF, insOp = -INF, delOp = -INF;
+                    offset = i-L[k%3];
+                    int32_t offsetDiag = L[k%3]-L[(k+1)%3]+offset-1;
+                    int32_t offsetUp = L[k%3]-L[(k+2)%3]+offset;
+                    int32_t offsetLeft = L[k%3]-L[(k+2)%3]+offset-1;
+                   
+                    if (k==0) match = 0;
+                    
+                    if (offsetDiag>=0 && i-1>=0 && j-1>=0)
+                    {
+                        char refVal = ref[i-1];
+                        char queryVal = query[j-1];
+                        if (refVal == queryVal) match = H[(k+1)%3][offsetDiag] + matchPoints;
+                        else match = H[(k+1)%3][offsetDiag] + mismatchPoints;
+                    }
+                    __syncthreads();
+                    if (offsetUp >= 0)
+                        insOp = H[(k+2)%3][offsetUp] + gapOpenPoints;
+                    __syncthreads();
+                    if (offsetLeft >=0)
+                        delOp = H[(k+2)%3][offsetLeft] + gapOpenPoints;
+                    __syncthreads();
+
+                     
+                    H[k%3][offset] = max3(insOp,delOp,match);
+                   __syncthreads();
+                    score[offset] = H[k%3][offset];
+                    __syncthreads();
+                }
+                max_seen_current = reduce_max(H[k%3],(U[k%3]-L[k%3]+1),bs);
+                __syncthreads();
+                if(max_seen_current<max_seen_antidiag-(*Xdrop_value))
+                {
+                    break;
+                }
+                else
+                {
+                    max_seen_antidiag = max_seen_current;
+                }
+                __syncthreads();
+                
+            }
+            if(tx==0)       //Thread 0 of each block updates its scores to d_scores
+            d_scores[n] = score[offset];
+        }
+    }
 
 
 void NWGPU::NWonGPU
@@ -442,7 +614,10 @@ void NWGPU::NWonGPU
 
     int blockPerGrid = 1024;
     int threadsPerBlock = 256;
-
+    int *d_xdrop;
+    int xdrop_value = 20;
+    cudaMalloc(&d_xdrop,sizeof(int));
+    cudaMemcpy(d_xdrop,&xdrop_value,sizeof(int),cudaMemcpyHostToDevice);
 
     alignSeqToSeq<<<blockPerGrid,threadsPerBlock>>>( d_numAlignments,
                             d_ref,
@@ -456,7 +631,8 @@ void NWGPU::NWonGPU
                             d_gapOpen,
                             d_scores,
                             d_tbPointers,
-                            d_tbPointersLen);
+                            d_tbPointersLen,
+			    d_xdrop);
 
     cudaDeviceSynchronize();
 
