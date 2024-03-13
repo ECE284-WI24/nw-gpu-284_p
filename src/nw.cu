@@ -427,14 +427,14 @@ __inline__ __device__ void warpReduce(volatile int32_t *input,
 		input[myTId] = (input[myTId] > input[myTId + 1]) ? input[myTId] : input[myTId + 1];
 }
 
-__inline__ __device__ int_32_t reduce_max(int32_t *input, int32_t dim, int n_threads){
+__inline__ __device__ int32_t reduce_max(int32_t *input, int32_t dim, int n_threads){
 	unsigned int myTId = threadIdx.x;   
 	if(dim>32){
 		for(int i = n_threads/2; i >32; i>>=1){
 			if(myTId < i){
 						input[myTId] = (input[myTId] > input[myTId + i]) ? input[myTId] : input[myTId + i];
 			}__syncthreads();
-		}//__syncthreads();
+		}
 	}
 	if(myTId<32)
 		warpReduce(input, myTId);
@@ -575,9 +575,13 @@ __global__ void alignSeqToSeq
                    __syncthreads();
                     score[offset] = H[k%3][offset];
                     __syncthreads();
-                }
-                max_seen_current = reduce_max(H[k%3],(U[k%3]-L[k%3]+1),bs);
+                   //int32_t max_seen_current_temp = reduce_max(H[k%3],(U[k%3]-L[k%3]+1),bs);
+                   if(tx==0){
+                       max_seen_current = max_seen_current_temp;
+                   }
                 __syncthreads();
+                }
+                if(tx==0){
                 if(max_seen_current<max_seen_antidiag-(*Xdrop_value))
                 {
                     break;
@@ -586,7 +590,8 @@ __global__ void alignSeqToSeq
                 {
                     max_seen_antidiag = max_seen_current;
                 }
-                __syncthreads();
+               // __syncthreads();
+                }
                 
             }
             if(tx==0)       //Thread 0 of each block updates its scores to d_scores
