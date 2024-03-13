@@ -515,6 +515,7 @@ __global__ void alignSeqToSeq
             int32_t maxScore = 0;
 
             __shared__ int32_t H[3][500];
+            __shared__ int32_t temp_h3[500];
            
             int32_t L[3], U[3];
 
@@ -532,7 +533,9 @@ __global__ void alignSeqToSeq
                 __syncthreads();
            for (size_t i=0; i<3; i++)
             {
-                for (size_t j=tx; j<500; j+=bs) H[i][j] = 0;
+                for (size_t j=tx; j<500; j+=bs) {H[i][j] = 0;
+                temp_h3[j] = 0;
+                }
             }
 
             __syncthreads();    
@@ -573,18 +576,35 @@ __global__ void alignSeqToSeq
                      
                     H[k%3][offset] = max3(insOp,delOp,match);
                    __syncthreads();
+                   temp_h3[offset] = H[k%3][offset];
+                   __syncthreads();
                     score[offset] = H[k%3][offset];
                     __syncthreads();
                    //int32_t max_seen_current_temp = reduce_max(H[k%3],(U[k%3]-L[k%3]+1),bs);
+                   for(int stride = bs / 2; stride > 0; stride >>= 1) {
+                    if (tx < stride) {
+                        int idx1 = tx;
+                        int idx2 = tx + stride;
+                        temp_h3[idx1] = max(temp_h3[idx1], temp_h3[idx2]);
+                    }
+                    // Wait for all threads to complete their operation at this stride
+                    __syncthreads();
+                 }
+
+                // At this point, H[k%3][0] holds the maximum value
                    if(tx==0){
-                       max_seen_current = max_seen_current_temp;
+                       max_seen_current = temp_h3[0];
+                       //printf("Max = %d",max_seen_current);
                    }
+                 //  atomicMax(&max_seen_current, H[k%3][offset]);
                 __syncthreads();
                 }
                 if(tx==0){
                 if(max_seen_current<max_seen_antidiag-(*Xdrop_value))
                 {
+                    //if(bx==0){printf("Breaking");}
                     break;
+                    
                 }
                 else
                 {
@@ -620,7 +640,7 @@ void NWGPU::NWonGPU
     int blockPerGrid = 1024;
     int threadsPerBlock = 256;
     int *d_xdrop;
-    int xdrop_value = 20;
+    int xdrop_value = 2;
     cudaMalloc(&d_xdrop,sizeof(int));
     cudaMemcpy(d_xdrop,&xdrop_value,sizeof(int),cudaMemcpyHostToDevice);
 
