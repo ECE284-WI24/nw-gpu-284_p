@@ -408,6 +408,8 @@ __global__ void alignSeqToSeq
 
 
 
+
+
 void NWGPU::NWonGPU
 (
     size_t d_numAlignments,

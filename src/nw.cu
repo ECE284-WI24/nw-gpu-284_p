@@ -341,10 +341,6 @@ __global__ void alignSeqToSeq
     int gs = gridDim.x;
     int tid = threadIdx.x + blockIdx.x*blockDim.x;
 
-//	if(tx==0 && bx==0){
-//		printf("Xdrop  val = %d",*Xdrop_value);
-//	}
-
         for (size_t n= blockIdx.x; n<d_numAlignments; n+= gridDim.x)
         {
             size_t currentRefLength = refLen[n];
@@ -361,19 +357,17 @@ __global__ void alignSeqToSeq
                     max_seen_antidiag = -INF;    
                     max_seen_current = -INF;  
                 }
-                __syncthreads();
-            //    Create shared memory for query and reference
+            
+            //    Create shared memory for query and reference, so that we don't have to worry about the memory coalsced
             __shared__ char ref[256];
             __shared__ char query[256];
 
                         if(tx<currentRefLength){
                 ref[tx] = d_ref[ref_index];
             }
-                    __syncthreads();
                     if(tx<currentQueryLength){
                         query[tx] = d_query[query_index];
                     }
-                    __syncthreads();
             
             
             int8_t * currentTbPointers = tbPointers + n*512;
@@ -381,9 +375,10 @@ __global__ void alignSeqToSeq
 
             size_t maxWFLen = currentRefLength + currentQueryLength + 2; //wavefront length
 
-            __shared__ int32_t score[500];
-            for (size_t i=tx;i<500;i+=bs) {score[i] = 0; }//insOp[i] = -INF; delOp[i] = -INF;}
-            __syncthreads();
+           __shared__ int32_t score[500];
+           int32_t offset = 0;
+           int32_t k = 0;
+            for (size_t i=tx;i<500;i+=bs) {score[i] = 0;}
             int32_t maxScore = 0;
 
             __shared__ int32_t H[3][500];
@@ -398,29 +393,26 @@ __global__ void alignSeqToSeq
 
             int8_t state=0;
 
-            for(size_t i=tx; i<3; i+=bs)
+            for(size_t i=0; i<3; i++)
             {
                 L[i]=0; U[i]=0;
             }
-                __syncthreads();
            for (size_t i=0; i<3; i++)
             {
                 for (size_t j=tx; j<500; j+=bs) {H[i][j] = 0;
                 temp_h3[j] = 0;
                 }
             }
-
             __syncthreads();    
-                int32_t offset = 0;
             for (int32_t k=0; k<currentRefLength+currentQueryLength+1; k++)
             {
                 L[k%3] = (k<=currentQueryLength)?0:k-currentQueryLength;
                 U[k%3] = (k<=currentRefLength)?k:currentRefLength;
                 wfLL[k] = L[k%3];
                 wfLen[k] = U[k%3]-L[k%3]+1;
-
-              for(int32_t i=L[k%3]+tx; i<U[k%3]+1; i+=bs) // i -> Reference Index
+                if(L[k%3]+tx<U[k%3]+1)
                 {   
+                    int32_t i = L[k%3] + tx;
                     int32_t j=(k-i); //j->Query Index
                     int32_t match = -INF, insOp = -INF, delOp = -INF;
                     offset = i-L[k%3];
@@ -437,27 +429,18 @@ __global__ void alignSeqToSeq
                         if (refVal == queryVal) match = H[(k+1)%3][offsetDiag] + matchPoints;
                         else match = H[(k+1)%3][offsetDiag] + mismatchPoints;
                     }
-                    __syncthreads();
                     if (offsetUp >= 0)
                         insOp = H[(k+2)%3][offsetUp] + gapOpenPoints;
-                    __syncthreads();
                     if (offsetLeft >=0)
                         delOp = H[(k+2)%3][offsetLeft] + gapOpenPoints;
-                    __syncthreads();
-
                      
                     H[k%3][offset] = max3(insOp,delOp,match);
-                   __syncthreads();
                    temp_h3[offset] = H[k%3][offset];
-                   __syncthreads();
                     score[offset] = H[k%3][offset];
-                    __syncthreads();
-                    if(bx==0){
-                              //  printf("tx = %d,k = %d, %d %d \n",tx,k,temp_h3[offset],H[k%3][offset]);
-                    }
-                    __syncthreads();
-                   //int32_t max_seen_current_temp = reduce_max(H[k%3],(U[k%3]-L[k%3]+1),bs);
-                   for(int stride = bs / 2; stride > 0; stride >>= 1) {
+                }
+                __syncthreads();    //Wait for all threads to update the H array
+                //Use reduction to find max in current diagnol
+            for(int stride = bs / 2; stride > 0; stride >>= 1) {
                     if (tx < stride) {
                         int idx1 = tx;
                         int idx2 = tx + stride;
@@ -466,20 +449,15 @@ __global__ void alignSeqToSeq
                     // Wait for all threads to complete their operation at this stride
                     __syncthreads();
                  }
-
-                // At this point, H[k%3][0] holds the maximum value
                    if(tx==0){
                        max_seen_current = temp_h3[0];
-                       //if(bx==0) printf("Max = %d, %d, x = %d %d\n",max_seen_current,max_seen_antidiag,(*Xdrop_value),max_seen_antidiag-(*Xdrop_value));
                    }
-                 //  atomicMax(&max_seen_current, H[k%3][offset]);
-                __syncthreads();
-                }
                 if(tx==0){
                 if(max_seen_current<=max_seen_antidiag-(*Xdrop_value))
                 {
-                    //if(bx==0) printf("Breaking k = %d",k);
                     score[offset] = max_seen_antidiag;
+                    if(bx==4)
+                    printf("Breaking at Diagnoal %d \n\n",k);
                     break;
                     
                 }
@@ -487,9 +465,7 @@ __global__ void alignSeqToSeq
                 {
                     max_seen_antidiag = (max_seen_current>max_seen_antidiag)?max_seen_current:max_seen_antidiag;
                 }
-                //__syncthreads();
-                }
-                
+                }               
             }
             if(tx==0)       //Thread 0 of each block updates its scores to d_scores
             d_scores[n] = score[offset];
@@ -498,9 +474,149 @@ __global__ void alignSeqToSeq
 
 
 
+/*
+//With Xdrop serial implementation
+__global__ void alignSeqToSeq
+(
+    size_t d_numAlignments,
+    char* d_ref,
+    char* d_query,
+    size_t * refLen,
+    size_t * queryLen,
+    size_t * refStartCord,
+    size_t * queryStartCord,
+    int matchPoints, 
+    int mismatchPoints,
+    int gapOpenPoints,
+    int * d_scores,
+    int8_t * tbPointers,
+    int32_t * tbPointersLen,
+    int *Xdrop_value
+){
+
+    int tx = threadIdx.x;
+    int bx = blockIdx.x;
+
+    int bs = blockDim.x;
+    int gs = gridDim.x;
+    int tid = threadIdx.x + blockIdx.x*blockDim.x;
+
+	if(tx==0 && bx==0){
 
 
-/* Without Xdrop
+        for (size_t n= 0; n<d_numAlignments; n++)
+        {
+            int32_t max_seen_antidiag = -INF;    
+            int32_t max_seen_current = -INF; 
+
+           size_t currentRefLength = refLen[n];
+            size_t currentQueryLength = queryLen[n];
+
+            size_t currentRefStartCord = refStartCord[n];
+            size_t currentQueryStartCord = queryStartCord[n];
+
+            char * ref = d_ref + currentRefStartCord;
+            char * query = d_query + currentQueryStartCord;
+            
+            int8_t * currentTbPointers = tbPointers + n*512;
+            int32_t * currentTbPointersLen = tbPointersLen + n;
+
+            size_t maxWFLen = currentRefLength + currentQueryLength + 2; //wavefront length
+
+            __shared__ int32_t score[500];
+            for (size_t i = 0;i<500;i++) score[i] = 0;
+            int32_t maxScore = 0;
+
+            int32_t H[3][500];
+            int32_t L[3], U[3];
+
+            int32_t wfLL[256*2+2];
+            int32_t wfLen[256*2+2];
+            int8_t tbMatrix[258*258]; //(256+2)^2
+            int32_t tbIdx = 0;
+               int8_t state=0;
+            for(size_t i=0;i<(258*258);i++){
+                    tbMatrix[i] = 2;
+            }
+         
+
+            for(size_t i=0; i<3; i++)
+            {
+                L[i]=0; U[i]=0;
+            }
+
+            for (size_t i=0; i<3; i++)
+            {
+                for (size_t j=0; j<500; j++) H[i][j] = 0;
+            }
+
+   
+                int32_t offset = 0;
+            for (int32_t k=0; k<currentRefLength+currentQueryLength+1; k++)
+            {
+                L[k%3] = (k<=currentQueryLength)?0:k-currentQueryLength;
+                U[k%3] = (k<=currentRefLength)?k:currentRefLength;
+                wfLL[k] = L[k%3];
+                wfLen[k] = U[k%3]-L[k%3]+1;
+                int32_t max_temp = -INF;
+                for(int32_t i=L[k%3]; i<U[k%3]+1; i++) // i -> Reference Index
+                {   
+                    int32_t j=(k-i); //j->Query Index
+                    int32_t match = -INF, insOp = -INF, delOp = -INF;
+                    offset = i-L[k%3];
+                    int32_t offsetDiag = L[k%3]-L[(k+1)%3]+offset-1;
+                    int32_t offsetUp = L[k%3]-L[(k+2)%3]+offset;
+                    int32_t offsetLeft = L[k%3]-L[(k+2)%3]+offset-1;
+
+
+                    if (k==0) match = 0;
+                    
+                    if (offsetDiag>=0)
+                    {
+                        char refVal = ref[i-1];
+                        char queryVal = query[j-1];
+                        if (refVal == queryVal) match = H[(k+1)%3][offsetDiag] + matchPoints;
+                        else match = H[(k+1)%3][offsetDiag] + mismatchPoints;
+                    }
+                    
+                    if (offsetUp >= 0)
+                        insOp = H[(k+2)%3][offsetUp] + gapOpenPoints;
+
+                    if (offsetLeft >=0)
+                        delOp = H[(k+2)%3][offsetLeft] + gapOpenPoints;
+
+                    
+                        H[k%3][offset] = max3(match,insOp,delOp);
+                        score[offset] = H[k%3][offset];
+                    
+                }
+                 for(int32_t i=L[k%3]; i<U[k%3]+1; i++) // i -> Reference Index
+                {
+                 int td = i-L[k%3];
+                              if(H[k%3][td]>max_temp)
+                            max_temp = H[k%3][td];
+                    }
+                    max_seen_current = max_temp;
+                if(max_seen_current<=max_seen_antidiag-(*Xdrop_value))
+                {
+                    score[offset] = max_seen_antidiag;
+                    break;
+                    
+                }
+                else
+                {
+                    max_seen_antidiag = (max_seen_current>max_seen_antidiag)?max_seen_current:max_seen_antidiag;
+                }
+                
+            }
+            d_scores[n] = score[offset];
+        }
+    }
+}
+*/
+
+/*
+// Without Xdrop
 __global__ void alignSeqToSeq
 (
     size_t d_numAlignments,
@@ -589,8 +705,10 @@ __global__ void alignSeqToSeq
                 wfLL[k] = L[k%3];
                 wfLen[k] = U[k%3]-L[k%3]+1;
 
-              for(int32_t i=L[k%3]+tx; i<U[k%3]+1; i+=bs) // i -> Reference Index
+              //for(int32_t i=L[k%3]+tx; i<U[k%3]+1; i+=bs) // i -> Reference Index
+              if(L[k%3]+tx<U[k%3]+1)
                 {   
+                    int32_t i = L[k%3]+tx;
                     int32_t j=(k-i); //j->Query Index
                     int32_t match = -INF, insOp = -INF, delOp = -INF;
                     offset = i-L[k%3];
@@ -607,21 +725,21 @@ __global__ void alignSeqToSeq
                         if (refVal == queryVal) match = H[(k+1)%3][offsetDiag] + matchPoints;
                         else match = H[(k+1)%3][offsetDiag] + mismatchPoints;
                     }
-                    __syncthreads();
+                    //__syncthreads();
                     if (offsetUp >= 0)
                         insOp = H[(k+2)%3][offsetUp] + gapOpenPoints;
-                    __syncthreads();
+                    //__syncthreads();
                     if (offsetLeft >=0)
                         delOp = H[(k+2)%3][offsetLeft] + gapOpenPoints;
-                    __syncthreads();
+                    //__syncthreads();
 
                      
                     H[k%3][offset] = max3(insOp,delOp,match);
-                   __syncthreads();
+                   //__syncthreads();
                     score[offset] = H[k%3][offset];
-                    __syncthreads();
+                   // __syncthreads();
                 }
-                
+                __syncthreads();
             }
             if(tx==0)       //Thread 0 of each block updates its scores to d_scores
             d_scores[n] = score[offset];
@@ -630,175 +748,6 @@ __global__ void alignSeqToSeq
 */
 
 
-/*
-//With Xdrop serial implementation
-__global__ void alignSeqToSeq
-(
-    size_t d_numAlignments,
-    char* d_ref,
-    char* d_query,
-    size_t * refLen,
-    size_t * queryLen,
-    size_t * refStartCord,
-    size_t * queryStartCord,
-    int matchPoints, 
-    int mismatchPoints,
-    int gapOpenPoints,
-    int * d_scores,
-    int8_t * tbPointers,
-    int32_t * tbPointersLen,
-    int *Xdrop_value
-){
-
-    int tx = threadIdx.x;
-    int bx = blockIdx.x;
-
-    int bs = blockDim.x;
-    int gs = gridDim.x;
-    int tid = threadIdx.x + blockIdx.x*blockDim.x;
-
-	if(tx==0 && bx==0){
-
-
-        for (size_t n= 0; n<d_numAlignments; n++)
-        {
-            int32_t max_seen_antidiag = -INF;    
-            int32_t max_seen_current = -INF; 
-
-           size_t currentRefLength = refLen[n];
-            size_t currentQueryLength = queryLen[n];
-
-            size_t currentRefStartCord = refStartCord[n];
-            size_t currentQueryStartCord = queryStartCord[n];
-
-            char * ref = d_ref + currentRefStartCord;
-            char * query = d_query + currentQueryStartCord;
-            
-            int8_t * currentTbPointers = tbPointers + n*512;
-            int32_t * currentTbPointersLen = tbPointersLen + n;
-
-            size_t maxWFLen = currentRefLength + currentQueryLength + 2; //wavefront length
-
-            int32_t score = 0;
-            int32_t maxScore = 0;
-
-            int32_t H[3][500];
-            int32_t L[3], U[3];
-
-            int32_t wfLL[256*2+2];
-            int32_t wfLen[256*2+2];
-            int8_t tbMatrix[258*258]; //(256+2)^2
-            int32_t tbIdx = 0;
-               int8_t state=0;
-            for(size_t i=0;i<(258*258);i++){
-                    tbMatrix[i] = 2;
-            }
-         
-
-            for(size_t i=0; i<3; i++)
-            {
-                L[i]=0; U[i]=0;
-            }
-
-            for (size_t i=0; i<3; i++)
-            {
-                for (size_t j=0; j<500; j++) H[i][j] = 0;
-            }
-
-   
-                int32_t offset = 0;
-            for (int32_t k=0; k<currentRefLength+currentQueryLength+1; k++)
-            {
-                L[k%3] = (k<=currentQueryLength)?0:k-currentQueryLength;
-                U[k%3] = (k<=currentRefLength)?k:currentRefLength;
-                wfLL[k] = L[k%3];
-                wfLen[k] = U[k%3]-L[k%3]+1;
-                int32_t max_temp = -INF;
-                for(int32_t i=L[k%3]; i<U[k%3]+1; i++) // i -> Reference Index
-                {   
-                    int32_t j=(k-i); //j->Query Index
-                    int32_t match = -INF, insOp = -INF, delOp = -INF;
-                    int32_t offset = i-L[k%3];
-                    int32_t offsetDiag = L[k%3]-L[(k+1)%3]+offset-1;
-                    int32_t offsetUp = L[k%3]-L[(k+2)%3]+offset;
-                    int32_t offsetLeft = L[k%3]-L[(k+2)%3]+offset-1;
-
-
-                    if (k==0) match = 0;
-                    
-                    if (offsetDiag>=0)
-                    {
-                        char refVal = ref[i-1];
-                        char queryVal = query[j-1];
-                        if (refVal == queryVal) match = H[(k+1)%3][offsetDiag] + matchPoints;
-                        else match = H[(k+1)%3][offsetDiag] + mismatchPoints;
-                    }
-                    
-                    if (offsetUp >= 0)
-                        insOp = H[(k+2)%3][offsetUp] + gapOpenPoints;
-
-                    if (offsetLeft >=0)
-                        delOp = H[(k+2)%3][offsetLeft] + gapOpenPoints;
-
-                    
-                    if (match > insOp) 
-                    {
-                        if (match > delOp) 
-                        {
-                            H[k%3][offset] = match;
-                            state = 0;
-                        }
-                        else 
-                        {
-                            H[k%3][offset] = delOp;
-                            state = 1;
-                        }
-                    }
-                    else if (insOp > delOp) 
-                    {
-                        H[k%3][offset] = insOp;
-                        state = 1;
-                    }
-                    else 
-                    {
-                        H[k%3][offset] = delOp;
-                        state = 2;
-                    }
-
-                    tbMatrix[tbIdx++] = state;
-
-                    score = H[k%3][offset];
-                   // max_temp = (max_temp<H[k%3][offset])?H[k%3][offset]:max_temp;
-                  //  if(k==500)
-                    //   printf("H[k%3][of] = %d, max_seen_current = %d,X = %d, %d \n",H[k%3][offset], max_seen_current, *(Xdrop_value), max_seen_antidiag-(*Xdrop_value)); 
-                    
-                }
-              //  int max_temp = -INF;
-                 for(int32_t i=L[k%3]; i<U[k%3]+1; i++) // i -> Reference Index
-                {
-                 int td = i-L[k%3];
-                              if(H[k%3][td]>max_temp)
-                            max_temp = H[k%3][td];
-                    }
-                    max_seen_current = max_temp;
-                if(max_seen_current<=max_seen_antidiag-(*Xdrop_value))
-                {
-                    score = max_seen_antidiag;
-                    break;
-                    
-                }
-                else
-                {
-                    max_seen_antidiag = (max_seen_current>max_seen_antidiag)?max_seen_current:max_seen_antidiag;
-                }
-                
-            }
-            tracebackSeqtoSeq(tbMatrix,tbIdx, wfLL, wfLen, currentRefLength, currentQueryLength, currentTbPointers, currentTbPointersLen);
-            d_scores[n] = score;
-        }
-    }
-}
-*/
 
 void NWGPU::NWonGPU
 (
@@ -817,14 +766,14 @@ void NWGPU::NWonGPU
     int32_t * d_tbPointersLen
 ){
 
-    int blockPerGrid = 2048;
-    int threadsPerBlock = 1024;
+    int blockPerGrid = 1024;
+    int threadsPerBlock = 256;
     int *d_xdrop;
-    int xdrop_value =3;
+    int xdrop_value =4;
     cudaMalloc(&d_xdrop,sizeof(int));
     cudaMemcpy(d_xdrop,&xdrop_value,sizeof(int),cudaMemcpyHostToDevice);
 
-    alignSeqToSeq<<<blockPerGrid,threadsPerBlock>>>( d_numAlignments,
+   alignSeqToSeq<<<blockPerGrid,threadsPerBlock>>>( d_numAlignments,
                             d_ref,
                             d_query,
                             d_refLen,
@@ -839,6 +788,23 @@ void NWGPU::NWonGPU
                             d_tbPointersLen,
 			    d_xdrop);
 
+        /*        
+
+             alignSeqToSeq<<<blockPerGrid,threadsPerBlock>>>( d_numAlignments,
+                            d_ref,
+                            d_query,
+                            d_refLen,
+                            d_queryLen,
+                            d_refStartCord,
+                            d_queryStartCord,
+                            d_match,
+                            d_mismatch,
+                            d_gapOpen,
+                            d_scores,
+                            d_tbPointers,
+                            d_tbPointersLen);
+                
+*/
     cudaDeviceSynchronize();
 
 }
