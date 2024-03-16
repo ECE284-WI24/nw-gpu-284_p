@@ -1,6 +1,12 @@
 [![Open in Visual Studio Code](https://classroom.github.com/assets/open-in-vscode-718a45dd9cf7e7f842a935f5ebbe5719a5e09af4491e668f4dbf3b35d5cca122.svg)](https://classroom.github.com/online_ide?assignment_repo_id=14019513&assignment_repo_type=AssignmentRepo)
 # GPU implementation of Needleman-Wunsch algorithm 
 
+## Run Instructions
+The run command for the CPU Implementation is the same as the GPU command, as shown below. Make sure you are in the cpu_impl directory when you run this command. The number of CPU threads can be changed in run-commands.sh using the -T parameter.
+```
+/opt/launch-sh/bin/launch.sh -v 2080ti -c 8 -g 1 -m 8 -i yatisht/ece284-wi24:latest -f ./nw-gpu-yatisht/run-commands.sh
+```
+
 ## TASKS
 * Parallelize the kernel `alignSeqToSeq` on the GPU
 * Multiple threads of a thread block map one pair of reads (reference and query) at a time
