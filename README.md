@@ -67,4 +67,8 @@ Once your environment is set up on the DSMLP server, you can begin code developm
 ```
 ssh yturakhia@dsmlp-login.ucsd.edu /opt/launch-sh/bin/launch.sh -v 2080ti -c 8 -g 1 -m 8 -i yatisht/ece284-wi24:latest -f ./nw-gpu-yatisht/run-commands.sh
 ```
-Note that the above command will require you to enter your AD account password again. This command should work and provide a sensible output for the assignment already provided. If you have reached this, you are in good shape to develop and test the code (make sure to modify `run-commands.sh` appropriately before testing). Happy code development! 
+Note that the above command will require you to enter your AD account password again. This command should work and provide a sensible output for the assignment already provided. If you have reached this, you are in good shape to develop and test the code (make sure to modify `run-commands.sh` appropriately before testing). 
+
+3. To Control Xdrop Value please use --X switch in run-commands.sh. For example to set the Xdrop value to 5 you can set using the following command 
+nvprof ./nw-gpu -r ../data/reference.fa -q ../data/query.fa --X 5. 
+Default Value is set to 4. Happy code development! 

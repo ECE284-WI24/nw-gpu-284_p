@@ -9,7 +9,7 @@
 
 #include "nw.cuh"
 
-
+int xdropval; // Default value for xdropval
 // For parsing the command line values
 namespace po = boost::program_options;
 
@@ -30,12 +30,14 @@ int main(int argc, char** argv) {
     std::vector<char *> ref, query;
     std::vector<size_t> refLen, queryLen;
 
+
     // Parse the command line options
     po::options_description desc{"Options"};
     desc.add_options()
     ("ref,r", po::value<std::string>(&refFilename)->required(), "Reference FASTA file name [REQUIRED].")
     ("query,q", po::value<std::string>(&queryFilename)->required(), "Query FASTA file name [REQUIRED].")
     ("numThreads,T", po::value<uint32_t>(&numThreads)->default_value(1), "Number of Threads (range: 1-8)")
+    ("X", po::value<int>(&xdropval)->default_value(4), "Set the X-drop value")
     ("help,h", "Print help messages");
 
     po::options_description allOptions;

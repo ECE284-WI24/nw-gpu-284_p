@@ -4,7 +4,7 @@
 #include "nw.cuh"
 #endif
 
-
+extern int xdropval;
 void printGpuProperties () {
     int nDevices;
 
@@ -769,7 +769,8 @@ void NWGPU::NWonGPU
     int blockPerGrid = 1024;
     int threadsPerBlock = 256;
     int *d_xdrop;
-    int xdrop_value =4;
+    int xdrop_value = xdropval;
+  //  printf("Thge xdrop value = %d\n",xdropval);
     cudaMalloc(&d_xdrop,sizeof(int));
     cudaMemcpy(d_xdrop,&xdrop_value,sizeof(int),cudaMemcpyHostToDevice);
 
